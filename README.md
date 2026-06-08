@@ -4,7 +4,7 @@ This repository is a pi package that can host multiple pi extensions.
 
 ## Extensions
 
-- `extensions/web-use/` — pipe-driven browser web research extension. Registers `web_research` and `/web-use-status`.
+- `extensions/web-use/` — Patchright-driven browser web research extension. Registers `web_research` and `/web-use-status`.
 - `extensions/web-automation/` — manual web automation probe loader. Registers `/enable-web-automation-probe`; the `web_automation_probe` tool is only added after that command is run.
 
 ## Use locally

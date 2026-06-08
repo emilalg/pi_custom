@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { evaluate, navigate, sanitizeProfile, withBrowser, type PipeCdp } from "../../lib/browser-cdp.js";
+import { evaluate, navigate, sanitizeProfile, withBrowser } from "../../lib/browser.js";
+import type { Page, Request, Response } from "patchright";
 
 type TextPart = { type: "text"; text: string };
 type NetworkEntry = {
@@ -48,7 +49,7 @@ function redactHeaders(headers: Record<string, unknown> = {}): Record<string, st
 
 function interestingRequest(entry: NetworkEntry): boolean {
 	if (!entry.url || !/^https?:/i.test(entry.url)) return false;
-	if (["XHR", "Fetch", "Document"].includes(entry.type || "")) return true;
+	if (["xhr", "fetch", "document"].includes((entry.type || "").toLowerCase())) return true;
 	return /json|graphql|api|search|models|pricing|catalog|list|query/i.test(`${entry.url} ${entry.mimeType || ""}`);
 }
 
@@ -61,10 +62,9 @@ async function searchFirstResult(task: string, signal?: AbortSignal): Promise<st
 	return /^https?:/i.test(decoded) ? decoded : undefined;
 }
 
-async function collectDomEvidence(cdp: PipeCdp, sessionId: string) {
+async function collectDomEvidence(page: Page) {
 	return await evaluate(
-		cdp,
-		sessionId,
+		page,
 		String.raw`(() => {
 			const clean = s => (s || '').replace(/\s+/g, ' ').trim();
 			const clip = s => clean(s).slice(0, ${MAX_SNIPPET_CHARS});
@@ -96,47 +96,51 @@ async function collectDomEvidence(cdp: PipeCdp, sessionId: string) {
 }
 
 async function probeSite(task: string, url: string, profile: string, signal?: AbortSignal) {
-	return await withBrowser(profile, signal, async (cdp, sessionId) => {
-		const byId = new Map<string, NetworkEntry>();
-		cdp.on("Network.requestWillBeSent", (params) => {
-			const entry: NetworkEntry = byId.get(params.requestId) ?? { requestId: params.requestId };
-			entry.type = params.type ?? entry.type;
-			entry.method = params.request?.method;
-			entry.url = params.request?.url;
-			entry.requestHeaders = redactHeaders(params.request?.headers);
-			byId.set(params.requestId, entry);
+	return await withBrowser(profile, signal, async ({ page }) => {
+		const byRequest = new Map<Request, NetworkEntry>();
+		const responses = new Map<Request, Response>();
+		let nextRequestId = 1;
+
+		page.on("request", (request) => {
+			const entry: NetworkEntry = byRequest.get(request) ?? { requestId: String(nextRequestId++) };
+			entry.method = request.method();
+			entry.url = request.url();
+			entry.requestHeaders = redactHeaders(request.headers());
+			byRequest.set(request, entry);
 		});
-		cdp.on("Network.responseReceived", (params) => {
-			const entry: NetworkEntry = byId.get(params.requestId) ?? { requestId: params.requestId };
-			entry.type = params.type ?? entry.type;
-			entry.url = params.response?.url ?? entry.url;
-			entry.status = params.response?.status;
-			entry.mimeType = params.response?.mimeType;
-			entry.responseHeaders = redactHeaders(params.response?.headers);
-			byId.set(params.requestId, entry);
+		page.on("response", (response) => {
+			const request = response.request();
+			const entry: NetworkEntry = byRequest.get(request) ?? { requestId: String(nextRequestId++) };
+			entry.type = request.resourceType();
+			entry.method = request.method();
+			entry.url = response.url();
+			entry.status = response.status();
+			entry.mimeType = response.headers()["content-type"];
+			entry.responseHeaders = redactHeaders(response.headers());
+			byRequest.set(request, entry);
+			responses.set(request, response);
 		});
 
-		await cdp.send("Network.enable", {}, sessionId);
-		await navigate(cdp, sessionId, url);
-		const dom = await collectDomEvidence(cdp, sessionId);
+		await navigate(page, url);
+		const dom = await collectDomEvidence(page);
 
-		const requests = [...byId.values()].filter(interestingRequest).slice(0, MAX_REQUESTS);
-		for (const entry of requests) {
-			if (!entry.requestId || !/json|graphql|javascript/i.test(entry.mimeType || "") || !/[XF]/.test(entry.type || "")) continue;
+		const requests = [...byRequest.entries()].map(([request, entry]) => ({ request, entry })).filter(({ entry }) => interestingRequest(entry)).slice(0, MAX_REQUESTS);
+		for (const { request, entry } of requests) {
+			if (!/json|graphql|javascript/i.test(entry.mimeType || "") || !/xhr|fetch/i.test(entry.type || "")) continue;
 			try {
-				const body = await cdp.send("Network.getResponseBody", { requestId: entry.requestId }, sessionId);
-				entry.bodyPreview = String(body.body || "").slice(0, MAX_BODY_PREVIEW);
+				const response = responses.get(request);
+				entry.bodyPreview = response ? (await response.text()).slice(0, MAX_BODY_PREVIEW) : undefined;
 			} catch {
 				// Body may be unavailable after navigation; metadata is still useful.
 			}
 		}
 
-		return { task, requestedUrl: url, dom, requests };
+		return { task, requestedUrl: url, dom, requests: requests.map(({ entry }) => entry) };
 	});
 }
 
 function summarizeProbe(result: Awaited<ReturnType<typeof probeSite>>): string {
-	const apiish = result.requests.filter((r) => r.type === "XHR" || r.type === "Fetch" || /json|graphql|api/i.test(`${r.url} ${r.mimeType}`));
+	const apiish = result.requests.filter((r) => ["xhr", "fetch"].includes((r.type || "").toLowerCase()) || /json|graphql|api/i.test(`${r.url} ${r.mimeType}`));
 	const lines = [
 		"## Web Automation Probe",
 		`URL: ${result.dom.finalUrl || result.requestedUrl}`,

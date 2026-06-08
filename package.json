@@ -29,5 +29,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "patchright": "^1.60.2"
   }
 }

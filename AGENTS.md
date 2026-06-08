@@ -18,7 +18,7 @@ This repo is a pi package for custom pi extensions and skills. Extensions live i
 
 ## Current extensions
 
-- `extensions/web-use/` — pipe-driven Chrome-for-Testing web research with `web_research` and `/web-use-status`.
+- `extensions/web-use/` — Patchright-driven Chrome-for-Testing web research with `web_research` and `/web-use-status`.
 - `extensions/web-automation/` — manual loader for scraping/browser automation probing. It registers `/enable-web-automation-probe`; `web_automation_probe` is only registered after that command is run.
 
 ## Current skills
@@ -29,7 +29,7 @@ This repo is a pi package for custom pi extensions and skills. Extensions live i
 
 ## Web-use notes
 
-- Browser control is direct CDP over `--remote-debugging-pipe`; do not add Puppeteer/Playwright drivers.
+- Browser control uses Patchright against the managed Chrome-for-Testing binary; avoid direct pipe/CDP control.
 - Chrome-for-Testing stable is installed under `~/.pi/web-search/chromium`.
 - Persistent global profiles live under `~/.pi/web-search/profiles/<profile>`.
 - Raw page text stays out of tool details unless `rawOutput: true`.

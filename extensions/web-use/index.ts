@@ -11,7 +11,7 @@ import {
 	withBrowser,
 	MANIFEST,
 	type ChromeManifest,
-} from "../../lib/browser-cdp.js";
+} from "../../lib/browser.js";
 
 const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ANALYST_SKILL = path.join(EXTENSION_DIR, "skills", "web-research-analyst");
@@ -90,20 +90,19 @@ function dedupeLinks(links: Array<{ title: string; url: string }>): Array<{ titl
 }
 
 async function collectSources(task: string, profile: string, signal?: AbortSignal): Promise<SearchSource[]> {
-	return await withBrowser(profile, signal, async (cdp, sessionId) => {
+	return await withBrowser(profile, signal, async ({ page }) => {
 		const sources: SearchSource[] = [];
 		const urlMatch = task.match(/https?:\/\/\S+/i);
 		const explicitUrl = urlMatch?.[0].replace(/[),.;!?]+$/, "");
 		const isUrl = Boolean(explicitUrl);
 		const startUrl = explicitUrl ?? `https://www.bing.com/search?q=${encodeURIComponent(task)}`;
-		await navigate(cdp, sessionId, startUrl);
+		await navigate(page, startUrl);
 
 		let links = isUrl
 			? [{ title: "", url: startUrl }]
 			: dedupeLinks(
 					((await evaluate(
-						cdp,
-						sessionId,
+						page,
 						`(() => { try { return Array.from(document.querySelectorAll('li.b_algo h2 a[href], .b_algo a[href], a.result__a[href]'))
 							.map(a => ({title: (a.innerText || a.textContent || '').trim(), url: a.href}))
 							.map(x => ({...x, url: x.url.includes('/l/?') ? new URL(x.url, location.href).searchParams.get('uddg') || x.url : x.url}))
@@ -116,9 +115,9 @@ async function collectSources(task: string, profile: string, signal?: AbortSigna
 		for (const link of links.slice(0, 8)) {
 			if (sources.length >= 4) break;
 			try {
-				await navigate(cdp, sessionId, link.url);
-				const title = ((await evaluate(cdp, sessionId, "document.title")) as string) || link.title || link.url;
-				const body = (((await evaluate(cdp, sessionId, "document.body ? document.body.innerText : ''")) as string) || "")
+				await navigate(page, link.url);
+				const title = ((await evaluate(page, "document.title")) as string) || link.title || link.url;
+				const body = (((await evaluate(page, "document.body ? document.body.innerText : ''")) as string) || "")
 					.replace(/\n{3,}/g, "\n\n")
 					.trim()
 					.slice(0, MAX_PAGE_CHARS);
@@ -185,7 +184,7 @@ export default function webUseExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "web_research",
 		label: "Web Research",
-		description: "Use a pipe-driven persistent Chrome-for-Testing browser profile to research the web and return analyzed results.",
+		description: "Use a Patchright-driven persistent Chrome-for-Testing browser profile to research the web and return analyzed results.",
 		promptSnippet: "Research current web information through a real browser. Raw page text is hidden unless rawOutput is true.",
 		promptGuidelines: [
 			"Use web_research for current web information, websites, and search tasks.",
