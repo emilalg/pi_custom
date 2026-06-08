@@ -7,7 +7,6 @@ import {
 	evaluate,
 	navigate,
 	readJson,
-	sanitizeProfile,
 	withBrowser,
 	MANIFEST,
 	type ChromeManifest,
@@ -88,12 +87,6 @@ async function searchEngineLinks(query: string, signal?: AbortSignal): Promise<A
 	return settled.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
 }
 
-function inferProfile(paramsProfile: string | undefined, ctx: unknown): string {
-	if (paramsProfile) return sanitizeProfile(paramsProfile);
-	const anyCtx = ctx as any;
-	return sanitizeProfile(anyCtx?.skill?.name ?? anyCtx?.activeSkill?.name ?? anyCtx?.currentSkill?.name ?? "default");
-}
-
 function isLikelySearchResult(url: string): boolean {
 	try {
 		const { hostname, pathname } = new URL(url);
@@ -125,8 +118,8 @@ function dedupeLinks(links: Array<{ title: string; url: string }>): Array<{ titl
 	return out;
 }
 
-async function collectSources(task: string, profile: string, signal?: AbortSignal): Promise<SearchSource[]> {
-	return await withBrowser(profile, signal, async ({ page }) => {
+async function collectSources(task: string, signal?: AbortSignal): Promise<SearchSource[]> {
+	return await withBrowser("fresh", signal, async ({ page }) => {
 		const sources: SearchSource[] = [];
 		const urlMatch = task.match(/https?:\/\/\S+/i);
 		const explicitUrl = urlMatch?.[0].replace(/[),.;!?]+$/, "");
@@ -219,22 +212,20 @@ export default function webUseExtension(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "web_research",
 		label: "Web Research",
-		description: "Use a Patchright-driven persistent Chrome-for-Testing browser profile to research the web and return analyzed results.",
-		promptSnippet: "Research current web information through a real browser. Raw page text is hidden unless rawOutput is true.",
+		description: "Use a Patchright-driven fresh Chrome-for-Testing browser profile to research the web and return analyzed results.",
+		promptSnippet: "Research current web information through a fresh browser. Raw page text is hidden unless rawOutput is true.",
 		promptGuidelines: [
 			"Use web_research for current web information, websites, and search tasks.",
-			"Provide a profile when the task belongs to a known skill/domain, e.g. data-analysis or programming.",
+			"Each web_research call uses an isolated fresh browser profile, so calls can run in parallel.",
 			"Do not request rawOutput unless the user explicitly asks for raw browser output.",
 		],
 		parameters: Type.Object({
 			task: Type.String({ description: "URL or research/search task." }),
-			profile: Type.Optional(Type.String({ description: "Global persistent browser profile key; defaults to active skill if detectable, else default." })),
 			rawOutput: Type.Optional(Type.Boolean({ description: "Include raw browser-extracted text in details. Default false." })),
 		}),
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal) {
 			try {
-				const profile = inferProfile(params.profile, ctx);
-				const sources = await collectSources(params.task, profile, signal);
+				const sources = await collectSources(params.task, signal);
 				let answer: string;
 				let analysisError: string | undefined;
 				try {
@@ -246,7 +237,7 @@ export default function webUseExtension(pi: ExtensionAPI) {
 				return {
 					content: text(answer),
 					details: {
-						profile,
+						profile: "fresh-per-call",
 						model: DEFAULT_MODEL,
 						sourceCount: sources.length,
 						sources: sources.map(({ title, url }) => ({ title, url })),

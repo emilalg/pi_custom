@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import { existsSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { chromium, type BrowserContext, type Page } from "patchright";
 
 export const ROOT = path.join(os.homedir(), ".pi", "web-search");
@@ -10,9 +10,7 @@ export const BROWSER_DIR = path.join(ROOT, "chromium");
 export const PROFILE_DIR = path.join(ROOT, "profiles");
 export const MANIFEST = path.join(BROWSER_DIR, "manifest.json");
 export const BROWSER_TIMEOUT_MS = 15_000;
-const PROFILE_LOCK_WAIT_MS = 30_000;
-const PROFILE_LOCK_STALE_MS = 10 * 60_000;
-const CHROME_SINGLETON_FILES = ["SingletonLock", "SingletonSocket", "SingletonCookie"];
+const STALE_BROWSER_MS = 15 * 60_000;
 
 export type ChromeManifest = { version: string; executablePath: string; installedAt: string };
 export type BrowserSession = { context: BrowserContext; page: Page };
@@ -112,19 +110,11 @@ export async function ensureStableChrome(signal?: AbortSignal): Promise<ChromeMa
 	return manifest;
 }
 
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-	return new Promise((resolve, reject) => {
-		if (signal?.aborted) return reject(new Error("Browser launch aborted"));
-		const timeout = setTimeout(done, ms);
-		const abort = () => {
-			clearTimeout(timeout);
-			reject(new Error("Browser launch aborted"));
-		};
-		function done() {
-			signal?.removeEventListener("abort", abort);
-			resolve();
-		}
-		signal?.addEventListener("abort", abort, { once: true });
+const pageProfileDirs = new WeakMap<Page, string>();
+
+function execFileText(command: string, args: string[]): Promise<string> {
+	return new Promise((resolve) => {
+		execFile(command, args, { maxBuffer: 5 * 1024 * 1024 }, (_error, stdout) => resolve(String(stdout || "")));
 	});
 }
 
@@ -137,81 +127,67 @@ function isPidAlive(pid: number): boolean {
 	}
 }
 
-async function chromeSingletonPid(userDataDir: string): Promise<number | undefined> {
-	const lockPath = path.join(userDataDir, "SingletonLock");
-	try {
-		const target = await fs.readlink(lockPath);
-		const match = target.match(/-(\d+)$/);
-		if (match) return Number(match[1]);
-	} catch {
-		// Some platforms/filesystems use a regular lock file; treat it as unparseable.
-	}
-	return undefined;
+async function touchUserDataDir(userDataDir: string | undefined): Promise<void> {
+	if (!userDataDir) return;
+	const now = new Date();
+	await fs.utimes(userDataDir, now, now).catch(() => undefined);
 }
 
-async function removeChromeSingletonFiles(userDataDir: string): Promise<void> {
-	await Promise.all(CHROME_SINGLETON_FILES.map((name) => fs.rm(path.join(userDataDir, name), { recursive: true, force: true })));
-}
-
-async function cleanupStaleChromeSingleton(userDataDir: string): Promise<void> {
-	const lockPath = path.join(userDataDir, "SingletonLock");
-	if (!existsSync(lockPath)) return;
-	const pid = await chromeSingletonPid(userDataDir);
-	if (pid && isPidAlive(pid)) {
-		throw new Error(
-			`Browser profile is already in use by Chrome pid ${pid}: ${userDataDir}. Use a different web_research profile or stop that process.`,
-		);
-	}
-	await removeChromeSingletonFiles(userDataDir);
-}
-
-async function acquireProfileLock(profile: string, userDataDir: string, signal?: AbortSignal): Promise<() => Promise<void>> {
-	const lockDir = path.join(PROFILE_DIR, `${profile}.pi-lock`);
-	const ownerPath = path.join(lockDir, "owner.json");
-	const started = Date.now();
-	while (true) {
-		if (signal?.aborted) throw new Error("Browser launch aborted");
+async function reapStaleBrowserProcesses(): Promise<void> {
+	const stdout = await execFileText("ps", ["-axo", "pid=,command="]);
+	const now = Date.now();
+	for (const line of stdout.split("\n")) {
+		if (!line.includes("Google Chrome for Testing") || !line.includes("--user-data-dir=")) continue;
+		const pid = Number(line.trim().match(/^(\d+)/)?.[1]);
+		const dirMatch = line.match(/--user-data-dir=(?:"([^"]+)"|'([^']+)'|(\S+))/);
+		const userDataDir = dirMatch?.[1] ?? dirMatch?.[2] ?? dirMatch?.[3];
+		if (!pid || !userDataDir || !path.resolve(userDataDir).startsWith(path.resolve(PROFILE_DIR, "tmp-"))) continue;
+		const stat = await fs.stat(userDataDir).catch(() => undefined);
+		if (stat && now - stat.mtimeMs < STALE_BROWSER_MS) continue;
 		try {
-			await fs.mkdir(lockDir, { recursive: false });
-			await fs.writeFile(ownerPath, JSON.stringify({ pid: process.pid, userDataDir, createdAt: new Date().toISOString() }, null, 2));
-			return async () => {
-				await fs.rm(lockDir, { recursive: true, force: true });
-			};
-		} catch (error: any) {
-			if (error?.code !== "EEXIST") throw error;
-			const owner = await readJson<{ pid?: number; createdAt?: string }>(ownerPath);
-			const age = owner?.createdAt ? Date.now() - Date.parse(owner.createdAt) : PROFILE_LOCK_STALE_MS + 1;
-			if ((owner?.pid && !isPidAlive(owner.pid)) || age > PROFILE_LOCK_STALE_MS) {
-				await fs.rm(lockDir, { recursive: true, force: true });
-				continue;
-			}
-			if (Date.now() - started > PROFILE_LOCK_WAIT_MS) {
-				throw new Error(
-					`Timed out waiting for browser profile lock (${profile}). Another web_research run is using it; pass a different profile to run concurrently.`,
-				);
-			}
-			await sleep(250, signal);
+			process.kill(pid, "SIGTERM");
+		} catch {
+			// Ignore races with processes that already exited.
 		}
+		setTimeout(() => {
+			if (isPidAlive(pid)) {
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {
+					// Ignore permission/race failures.
+				}
+			}
+		}, 5_000).unref();
 	}
+
+	const entries = await fs.readdir(PROFILE_DIR, { withFileTypes: true }).catch(() => []);
+	await Promise.all(
+		entries
+			.filter((entry) => entry.isDirectory() && entry.name.startsWith("tmp-"))
+			.map(async (entry) => {
+				const dir = path.join(PROFILE_DIR, entry.name);
+				const stat = await fs.stat(dir).catch(() => undefined);
+				if (stat && now - stat.mtimeMs > STALE_BROWSER_MS) await fs.rm(dir, { recursive: true, force: true });
+			}),
+	);
 }
 
 export async function withBrowser<T>(
-	profile: string,
+	_profile: string,
 	signal: AbortSignal | undefined,
 	fn: (session: BrowserSession) => Promise<T>,
 ): Promise<T> {
 	const chrome = await ensureStableChrome(signal);
-	const userDataDir = path.join(PROFILE_DIR, profile);
-	await fs.mkdir(userDataDir, { recursive: true });
+	await fs.mkdir(PROFILE_DIR, { recursive: true });
+	await reapStaleBrowserProcesses();
+	const userDataDir = await fs.mkdtemp(path.join(PROFILE_DIR, "tmp-"));
+	await touchUserDataDir(userDataDir);
 
 	let context: BrowserContext | undefined;
-	let releaseProfileLock: (() => Promise<void>) | undefined;
 	const abort = () => void context?.close().catch(() => undefined);
 	if (signal?.aborted) throw new Error("Browser launch aborted");
 	signal?.addEventListener("abort", abort, { once: true });
 	try {
-		releaseProfileLock = await acquireProfileLock(profile, userDataDir, signal);
-		await cleanupStaleChromeSingleton(userDataDir);
 		context = await chromium.launchPersistentContext(userDataDir, {
 			executablePath: chrome.executablePath,
 			headless: true,
@@ -226,22 +202,26 @@ export async function withBrowser<T>(
 			],
 		});
 		const page = context.pages()[0] ?? (await context.newPage());
+		pageProfileDirs.set(page, userDataDir);
 		page.setDefaultTimeout(BROWSER_TIMEOUT_MS);
 		page.setDefaultNavigationTimeout(BROWSER_TIMEOUT_MS);
 		return await fn({ context, page });
 	} finally {
 		signal?.removeEventListener("abort", abort);
 		await context?.close().catch(() => undefined);
-		await releaseProfileLock?.().catch(() => undefined);
+		await fs.rm(userDataDir, { recursive: true, force: true }).catch(() => undefined);
 	}
 }
 
 export async function evaluate(page: Page, expression: string): Promise<any> {
+	await touchUserDataDir(pageProfileDirs.get(page));
 	return await page.evaluate(expression as any);
 }
 
 export async function navigate(page: Page, url: string): Promise<void> {
+	await touchUserDataDir(pageProfileDirs.get(page));
 	await page.goto(url, { waitUntil: "domcontentloaded", timeout: BROWSER_TIMEOUT_MS });
 	await page.waitForLoadState("networkidle", { timeout: 2_500 }).catch(() => undefined);
 	await page.waitForTimeout(750);
+	await touchUserDataDir(pageProfileDirs.get(page));
 }
