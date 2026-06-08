@@ -16,8 +16,10 @@ import {
 const EXTENSION_DIR = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ANALYST_SKILL = path.join(EXTENSION_DIR, "skills", "web-research-analyst");
 const DEFAULT_MODEL = "openai-codex/gpt-5.4-mini";
-const MAX_PAGE_CHARS = 18_000;
-const MAX_RAW_CHARS = 80_000;
+const MAX_PAGE_CHARS = 24_000;
+const MAX_RAW_CHARS = 180_000;
+const MAX_SEARCH_LINKS = 18;
+const MAX_SOURCES = 8;
 
 type TextPart = { type: "text"; text: string };
 type SearchSource = { title: string; url: string; text: string };
@@ -35,21 +37,55 @@ function decodeHtml(value: string): string {
 		.replace(/&gt;/g, ">");
 }
 
-async function fallbackSearchLinks(query: string, signal?: AbortSignal): Promise<Array<{ title: string; url: string }>> {
-	const html = await (await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, { signal })).text();
+function cleanTitle(html: string): string {
+	return decodeHtml(html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
+}
+
+async function fetchText(url: string, signal?: AbortSignal): Promise<string> {
+	const res = await fetch(url, {
+		signal,
+		headers: { "user-agent": "Mozilla/5.0 AppleWebKit/537.36 Chrome Safari" },
+	});
+	if (!res.ok) return "";
+	return await res.text();
+}
+
+function extractSearchLinks(html: string, engine: "bing" | "duckduckgo" | "brave" | "yahoo"): Array<{ title: string; url: string }> {
 	const out: Array<{ title: string; url: string }> = [];
 	const seen = new Set<string>();
-	const re = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
-	for (const match of html.matchAll(re)) {
-		let url = decodeHtml(match[1]);
-		if (url.includes("/l/?")) url = new URL(url, "https://duckduckgo.com").searchParams.get("uddg") || url;
-		const title = decodeHtml(match[2].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
-		if (!/^https?:/i.test(url) || seen.has(url)) continue;
-		seen.add(url);
-		out.push({ title, url });
-		if (out.length >= 5) break;
+	const patterns: RegExp[] =
+		engine === "duckduckgo"
+			? [/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi]
+			: engine === "brave"
+				? [/<a[^>]+class="[^"]*result-header[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi]
+				: engine === "yahoo"
+					? [/<a[^>]+class="[^"]*d-ib[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi]
+					: [/<li[^>]+class="[^"]*b_algo[^"]*"[\s\S]*?<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi];
+	for (const re of patterns) {
+		for (const match of html.matchAll(re)) {
+			let url = decodeHtml(match[1]);
+			if (url.includes("/l/?")) url = new URL(url, "https://duckduckgo.com").searchParams.get("uddg") || url;
+			const title = cleanTitle(match[2]);
+			if (!/^https?:/i.test(url) || seen.has(url) || !title) continue;
+			seen.add(url);
+			out.push({ title, url });
+			if (out.length >= 8) break;
+		}
 	}
 	return out;
+}
+
+async function searchEngineLinks(query: string, signal?: AbortSignal): Promise<Array<{ title: string; url: string; engine: string }>> {
+	const searches = [
+		{ engine: "duckduckgo" as const, url: `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}` },
+		{ engine: "bing" as const, url: `https://www.bing.com/search?q=${encodeURIComponent(query)}` },
+		{ engine: "brave" as const, url: `https://search.brave.com/search?q=${encodeURIComponent(query)}` },
+		{ engine: "yahoo" as const, url: `https://search.yahoo.com/search?p=${encodeURIComponent(query)}` },
+	];
+	const settled = await Promise.allSettled(
+		searches.map(async (s) => extractSearchLinks(await fetchText(s.url, signal), s.engine).map((link) => ({ ...link, engine: s.engine }))),
+	);
+	return settled.flatMap((r) => (r.status === "fulfilled" ? r.value : []));
 }
 
 function inferProfile(paramsProfile: string | undefined, ctx: unknown): string {
@@ -62,7 +98,7 @@ function isLikelySearchResult(url: string): boolean {
 	try {
 		const { hostname, pathname } = new URL(url);
 		const host = hostname.replace(/^www\./, "").toLowerCase();
-		if (/^(bing|duckduckgo|google|microsoft)\./i.test(host)) return false;
+		if (/^(bing|duckduckgo|google|microsoft|search\.brave|brave|yahoo)\./i.test(host)) return false;
 		if (host === "apple.com" && pathname.startsWith("/app/duckduckgo")) return false;
 		if (host === "play.google.com" && pathname.startsWith("/store/apps/details")) return false;
 		return /^https?:/i.test(url);
@@ -98,22 +134,21 @@ async function collectSources(task: string, profile: string, signal?: AbortSigna
 		const startUrl = explicitUrl ?? `https://www.bing.com/search?q=${encodeURIComponent(task)}`;
 		await navigate(page, startUrl);
 
-		let links = isUrl
+		const browserLinks = isUrl
 			? [{ title: "", url: startUrl }]
-			: dedupeLinks(
-					((await evaluate(
-						page,
-						`(() => { try { return Array.from(document.querySelectorAll('li.b_algo h2 a[href], .b_algo a[href], a.result__a[href]'))
-							.map(a => ({title: (a.innerText || a.textContent || '').trim(), url: a.href}))
-							.map(x => ({...x, url: x.url.includes('/l/?') ? new URL(x.url, location.href).searchParams.get('uddg') || x.url : x.url}))
-							.filter((x, i, arr) => x.title && arr.findIndex(y => y.url === x.url) === i)
-							.slice(0, 10); } catch { return []; } })()`,
-					)) as Array<{ title: string; url: string }>),
-				);
-		if (!isUrl && links.length < 4) links = dedupeLinks([...links, ...(await fallbackSearchLinks(task, signal))]);
+			: (((await evaluate(
+					page,
+					`(() => { try { return Array.from(document.querySelectorAll('li.b_algo h2 a[href], .b_algo a[href], a.result__a[href]'))
+						.map(a => ({title: (a.innerText || a.textContent || '').trim(), url: a.href}))
+						.map(x => ({...x, url: x.url.includes('/l/?') ? new URL(x.url, location.href).searchParams.get('uddg') || x.url : x.url}))
+						.filter((x, i, arr) => x.title && arr.findIndex(y => y.url === x.url) === i)
+						.slice(0, 10); } catch { return []; } })()`,
+				)) as Array<{ title: string; url: string }>) ?? []);
+		const ensembleLinks = isUrl ? [] : await searchEngineLinks(task, signal);
+		const links = dedupeLinks([...browserLinks, ...ensembleLinks]).slice(0, MAX_SEARCH_LINKS);
 
-		for (const link of links.slice(0, 8)) {
-			if (sources.length >= 4) break;
+		for (const link of links) {
+			if (sources.length >= MAX_SOURCES) break;
 			try {
 				await navigate(page, link.url);
 				const title = ((await evaluate(page, "document.title")) as string) || link.title || link.url;

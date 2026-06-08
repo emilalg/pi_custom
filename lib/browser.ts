@@ -10,6 +10,9 @@ export const BROWSER_DIR = path.join(ROOT, "chromium");
 export const PROFILE_DIR = path.join(ROOT, "profiles");
 export const MANIFEST = path.join(BROWSER_DIR, "manifest.json");
 export const BROWSER_TIMEOUT_MS = 15_000;
+const PROFILE_LOCK_WAIT_MS = 30_000;
+const PROFILE_LOCK_STALE_MS = 10 * 60_000;
+const CHROME_SINGLETON_FILES = ["SingletonLock", "SingletonSocket", "SingletonCookie"];
 
 export type ChromeManifest = { version: string; executablePath: string; installedAt: string };
 export type BrowserSession = { context: BrowserContext; page: Page };
@@ -109,6 +112,89 @@ export async function ensureStableChrome(signal?: AbortSignal): Promise<ChromeMa
 	return manifest;
 }
 
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) return reject(new Error("Browser launch aborted"));
+		const timeout = setTimeout(done, ms);
+		const abort = () => {
+			clearTimeout(timeout);
+			reject(new Error("Browser launch aborted"));
+		};
+		function done() {
+			signal?.removeEventListener("abort", abort);
+			resolve();
+		}
+		signal?.addEventListener("abort", abort, { once: true });
+	});
+}
+
+function isPidAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error: any) {
+		return error?.code === "EPERM";
+	}
+}
+
+async function chromeSingletonPid(userDataDir: string): Promise<number | undefined> {
+	const lockPath = path.join(userDataDir, "SingletonLock");
+	try {
+		const target = await fs.readlink(lockPath);
+		const match = target.match(/-(\d+)$/);
+		if (match) return Number(match[1]);
+	} catch {
+		// Some platforms/filesystems use a regular lock file; treat it as unparseable.
+	}
+	return undefined;
+}
+
+async function removeChromeSingletonFiles(userDataDir: string): Promise<void> {
+	await Promise.all(CHROME_SINGLETON_FILES.map((name) => fs.rm(path.join(userDataDir, name), { recursive: true, force: true })));
+}
+
+async function cleanupStaleChromeSingleton(userDataDir: string): Promise<void> {
+	const lockPath = path.join(userDataDir, "SingletonLock");
+	if (!existsSync(lockPath)) return;
+	const pid = await chromeSingletonPid(userDataDir);
+	if (pid && isPidAlive(pid)) {
+		throw new Error(
+			`Browser profile is already in use by Chrome pid ${pid}: ${userDataDir}. Use a different web_research profile or stop that process.`,
+		);
+	}
+	await removeChromeSingletonFiles(userDataDir);
+}
+
+async function acquireProfileLock(profile: string, userDataDir: string, signal?: AbortSignal): Promise<() => Promise<void>> {
+	const lockDir = path.join(PROFILE_DIR, `${profile}.pi-lock`);
+	const ownerPath = path.join(lockDir, "owner.json");
+	const started = Date.now();
+	while (true) {
+		if (signal?.aborted) throw new Error("Browser launch aborted");
+		try {
+			await fs.mkdir(lockDir, { recursive: false });
+			await fs.writeFile(ownerPath, JSON.stringify({ pid: process.pid, userDataDir, createdAt: new Date().toISOString() }, null, 2));
+			return async () => {
+				await fs.rm(lockDir, { recursive: true, force: true });
+			};
+		} catch (error: any) {
+			if (error?.code !== "EEXIST") throw error;
+			const owner = await readJson<{ pid?: number; createdAt?: string }>(ownerPath);
+			const age = owner?.createdAt ? Date.now() - Date.parse(owner.createdAt) : PROFILE_LOCK_STALE_MS + 1;
+			if ((owner?.pid && !isPidAlive(owner.pid)) || age > PROFILE_LOCK_STALE_MS) {
+				await fs.rm(lockDir, { recursive: true, force: true });
+				continue;
+			}
+			if (Date.now() - started > PROFILE_LOCK_WAIT_MS) {
+				throw new Error(
+					`Timed out waiting for browser profile lock (${profile}). Another web_research run is using it; pass a different profile to run concurrently.`,
+				);
+			}
+			await sleep(250, signal);
+		}
+	}
+}
+
 export async function withBrowser<T>(
 	profile: string,
 	signal: AbortSignal | undefined,
@@ -119,10 +205,13 @@ export async function withBrowser<T>(
 	await fs.mkdir(userDataDir, { recursive: true });
 
 	let context: BrowserContext | undefined;
+	let releaseProfileLock: (() => Promise<void>) | undefined;
 	const abort = () => void context?.close().catch(() => undefined);
 	if (signal?.aborted) throw new Error("Browser launch aborted");
 	signal?.addEventListener("abort", abort, { once: true });
 	try {
+		releaseProfileLock = await acquireProfileLock(profile, userDataDir, signal);
+		await cleanupStaleChromeSingleton(userDataDir);
 		context = await chromium.launchPersistentContext(userDataDir, {
 			executablePath: chrome.executablePath,
 			headless: true,
@@ -143,6 +232,7 @@ export async function withBrowser<T>(
 	} finally {
 		signal?.removeEventListener("abort", abort);
 		await context?.close().catch(() => undefined);
+		await releaseProfileLock?.().catch(() => undefined);
 	}
 }
 
