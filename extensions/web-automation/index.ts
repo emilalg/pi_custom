@@ -1,0 +1,197 @@
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { evaluate, navigate, sanitizeProfile, withBrowser, type PipeCdp } from "../../lib/browser-cdp.js";
+
+type TextPart = { type: "text"; text: string };
+type NetworkEntry = {
+	requestId: string;
+	type?: string;
+	method?: string;
+	url?: string;
+	requestHeaders?: Record<string, string>;
+	status?: number;
+	mimeType?: string;
+	responseHeaders?: Record<string, string>;
+	bodyPreview?: string;
+};
+
+const MAX_REQUESTS = 80;
+const MAX_SNIPPET_CHARS = 1_500;
+const MAX_BODY_PREVIEW = 4_000;
+
+function text(value: string): TextPart[] {
+	return [{ type: "text", text: value }];
+}
+
+function inferProfile(paramsProfile: string | undefined, ctx: unknown): string {
+	if (paramsProfile) return sanitizeProfile(paramsProfile);
+	const anyCtx = ctx as any;
+	return sanitizeProfile(anyCtx?.skill?.name ?? anyCtx?.activeSkill?.name ?? anyCtx?.currentSkill?.name ?? "web-automation");
+}
+
+function extractUrl(task: string): string | undefined {
+	return task.match(/https?:\/\/\S+/i)?.[0].replace(/[),.;!?]+$/, "");
+}
+
+function redactHeaders(headers: Record<string, unknown> = {}): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [key, value] of Object.entries(headers)) {
+		const lower = key.toLowerCase();
+		if (["authorization", "cookie", "set-cookie", "x-api-key", "x-auth-token"].includes(lower)) {
+			out[key] = "<redacted-present>";
+		} else {
+			out[key] = String(value).slice(0, 500);
+		}
+	}
+	return out;
+}
+
+function interestingRequest(entry: NetworkEntry): boolean {
+	if (!entry.url || !/^https?:/i.test(entry.url)) return false;
+	if (["XHR", "Fetch", "Document"].includes(entry.type || "")) return true;
+	return /json|graphql|api|search|models|pricing|catalog|list|query/i.test(`${entry.url} ${entry.mimeType || ""}`);
+}
+
+async function searchFirstResult(task: string, signal?: AbortSignal): Promise<string | undefined> {
+	const html = await (await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(task)}`, { signal })).text();
+	const match = html.match(/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"/i);
+	if (!match) return undefined;
+	const decoded = match[1].replace(/&amp;/g, "&");
+	if (decoded.includes("/l/?")) return new URL(decoded, "https://duckduckgo.com").searchParams.get("uddg") || undefined;
+	return /^https?:/i.test(decoded) ? decoded : undefined;
+}
+
+async function collectDomEvidence(cdp: PipeCdp, sessionId: string) {
+	return await evaluate(
+		cdp,
+		sessionId,
+		String.raw`(() => {
+			const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+			const clip = s => clean(s).slice(0, ${MAX_SNIPPET_CHARS});
+			const attrs = el => Array.from(el.attributes || []).slice(0, 12).map(a => a.name + '=' + JSON.stringify(a.value)).join(' ');
+			const pick = (selector, limit) => Array.from(document.querySelectorAll(selector)).slice(0, limit).map(el => ({
+				selector,
+				tag: el.tagName.toLowerCase(),
+				text: clip(el.innerText || el.textContent || ''),
+				html: ('<' + el.tagName.toLowerCase() + (attrs(el) ? ' ' + attrs(el) : '') + '>' + clip(el.innerText || el.textContent || '') + '</' + el.tagName.toLowerCase() + '>').slice(0, ${MAX_SNIPPET_CHARS})
+			})).filter(x => x.text || x.html);
+			const embeddedJson = Array.from(document.querySelectorAll('script[type*="json"], script#__NEXT_DATA__, script[id*="data" i], script[id*="state" i]')).slice(0, 8).map(s => ({
+				id: s.id || '', type: s.type || '', text: (s.textContent || '').trim().slice(0, ${MAX_SNIPPET_CHARS})
+			})).filter(x => x.text);
+			return {
+				finalUrl: location.href,
+				title: document.title,
+				metaDescription: document.querySelector('meta[name="description"]')?.content || '',
+				visibleTextSample: (document.body?.innerText || '').replace(/\n{3,}/g, '\n\n').trim().slice(0, 5000),
+				links: Array.from(document.querySelectorAll('a[href]')).slice(0, 80).map(a => ({ text: clean(a.innerText || a.textContent || '').slice(0, 160), href: a.href })),
+				forms: Array.from(document.querySelectorAll('form')).slice(0, 10).map(f => ({ action: f.action, method: f.method, text: clip(f.innerText || ''), inputs: Array.from(f.querySelectorAll('input, select, textarea')).slice(0, 25).map(i => ({ tag: i.tagName.toLowerCase(), name: i.getAttribute('name'), type: i.getAttribute('type'), placeholder: i.getAttribute('placeholder') })) })),
+				snippets: [
+					...pick('[data-testid], [data-test], [data-cy]', 20),
+					...pick('table, [role="table"], [role="row"], article, main li, main [class]', 30)
+				],
+				embeddedJson
+			};
+		})()`,
+	);
+}
+
+async function probeSite(task: string, url: string, profile: string, signal?: AbortSignal) {
+	return await withBrowser(profile, signal, async (cdp, sessionId) => {
+		const byId = new Map<string, NetworkEntry>();
+		cdp.on("Network.requestWillBeSent", (params) => {
+			const entry: NetworkEntry = byId.get(params.requestId) ?? { requestId: params.requestId };
+			entry.type = params.type ?? entry.type;
+			entry.method = params.request?.method;
+			entry.url = params.request?.url;
+			entry.requestHeaders = redactHeaders(params.request?.headers);
+			byId.set(params.requestId, entry);
+		});
+		cdp.on("Network.responseReceived", (params) => {
+			const entry: NetworkEntry = byId.get(params.requestId) ?? { requestId: params.requestId };
+			entry.type = params.type ?? entry.type;
+			entry.url = params.response?.url ?? entry.url;
+			entry.status = params.response?.status;
+			entry.mimeType = params.response?.mimeType;
+			entry.responseHeaders = redactHeaders(params.response?.headers);
+			byId.set(params.requestId, entry);
+		});
+
+		await cdp.send("Network.enable", {}, sessionId);
+		await navigate(cdp, sessionId, url);
+		const dom = await collectDomEvidence(cdp, sessionId);
+
+		const requests = [...byId.values()].filter(interestingRequest).slice(0, MAX_REQUESTS);
+		for (const entry of requests) {
+			if (!entry.requestId || !/json|graphql|javascript/i.test(entry.mimeType || "") || !/[XF]/.test(entry.type || "")) continue;
+			try {
+				const body = await cdp.send("Network.getResponseBody", { requestId: entry.requestId }, sessionId);
+				entry.bodyPreview = String(body.body || "").slice(0, MAX_BODY_PREVIEW);
+			} catch {
+				// Body may be unavailable after navigation; metadata is still useful.
+			}
+		}
+
+		return { task, requestedUrl: url, dom, requests };
+	});
+}
+
+function summarizeProbe(result: Awaited<ReturnType<typeof probeSite>>): string {
+	const apiish = result.requests.filter((r) => r.type === "XHR" || r.type === "Fetch" || /json|graphql|api/i.test(`${r.url} ${r.mimeType}`));
+	const lines = [
+		"## Web Automation Probe",
+		`URL: ${result.dom.finalUrl || result.requestedUrl}`,
+		`Title: ${result.dom.title || "unknown"}`,
+		`Network requests captured: ${result.requests.length}`,
+		`API/XHR/fetch-like requests: ${apiish.length}`,
+		"",
+		"### Likely Relevant Requests",
+		...(apiish.slice(0, 12).map((r, i) => `[#${i + 1}] ${r.method || "GET"} ${r.url}\n- type/status/mime: ${r.type || "?"} / ${r.status || "?"} / ${r.mimeType || "?"}`) || []),
+		"",
+		"### DOM Evidence",
+		`- Links: ${result.dom.links?.length ?? 0}`,
+		`- Forms: ${result.dom.forms?.length ?? 0}`,
+		`- Embedded JSON/script data blocks: ${result.dom.embeddedJson?.length ?? 0}`,
+		`- Candidate snippets: ${result.dom.snippets?.length ?? 0}`,
+	];
+	return lines.join("\n");
+}
+
+export default function webAutomationExtension(pi: ExtensionAPI) {
+	pi.registerTool({
+		name: "web_automation_probe",
+		label: "Web Automation Probe",
+		description: "Inspect a website through Chrome for automation handoff evidence: DOM structure, embedded data, forms/links, and network requests/headers.",
+		promptSnippet: "Probe a target website for web automation evidence including DOM, embedded JSON, forms, links, and network API calls.",
+		promptGuidelines: [
+			"Use web_automation_probe when designing or evaluating a browser automation, extraction, QA, monitoring, or scraping approach for a specific public website.",
+			"Use web_automation_probe to gather evidence only; do not use it to bypass authentication, CAPTCHA, paywalls, or bot protections.",
+		],
+		parameters: Type.Object({
+			task: Type.String({ description: "Scraping directive, ideally including a target URL." }),
+			url: Type.Optional(Type.String({ description: "Explicit target URL. If omitted, the first URL in task is used; as a last resort a search result may be used." })),
+			profile: Type.Optional(Type.String({ description: "Persistent browser profile key. Default web-automation or active skill if detectable." })),
+			rawOutput: Type.Optional(Type.Boolean({ description: "Include detailed DOM/network evidence in details. Default true for this probe." })),
+		}),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			try {
+				const profile = inferProfile(params.profile, ctx);
+				const url = params.url || extractUrl(params.task) || (await searchFirstResult(params.task, signal));
+				if (!url) throw new Error("No target URL found. Provide a URL or a task specific enough to search.");
+				const result = await probeSite(params.task, url, profile, signal);
+				return {
+					content: text(summarizeProbe(result)),
+					details: {
+						profile,
+						requestedUrl: result.requestedUrl,
+						finalUrl: result.dom.finalUrl,
+						title: result.dom.title,
+						requests: result.requests,
+						dom: params.rawOutput === false ? undefined : result.dom,
+					},
+				};
+			} catch (error) {
+				return { content: text(error instanceof Error ? error.message : String(error)), details: undefined, isError: true };
+			}
+		},
+	});
+}

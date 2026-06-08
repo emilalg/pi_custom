@@ -1,0 +1,32 @@
+{
+  "name": "pi-custom-extensions",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A collection of custom pi extensions.",
+  "keywords": [
+    "pi-package",
+    "pi-extension"
+  ],
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./extensions/*/index.ts"
+    ],
+    "skills": [
+      "./skills/*"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^25.9.2",
+    "typebox": "*",
+    "typescript": "^5.8.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}
