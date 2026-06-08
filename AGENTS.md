@@ -2,18 +2,30 @@
 
 ## Purpose
 
-This repo is a pi package for custom pi extensions. Extensions live in `extensions/<name>/index.ts` and are loaded via `package.json`:
+This repo is a pi package for custom pi extensions and skills. Extensions live in `extensions/<name>/index.ts` and are loaded explicitly via `package.json`:
 
 ```json
 {
-  "pi": { "extensions": ["./extensions/*/index.ts"] }
+  "pi": {
+    "extensions": [
+      "./extensions/web-use/index.ts",
+      "./extensions/web-automation/index.ts"
+    ],
+    "skills": ["./skills/*"]
+  }
 }
 ```
 
 ## Current extensions
 
 - `extensions/web-use/` — pipe-driven Chrome-for-Testing web research with `web_research` and `/web-use-status`.
-- `extensions/placeholder/` — placeholder extension with `/placeholder-extension`.
+- `extensions/web-automation/` — manual loader for scraping/browser automation probing. It registers `/enable-web-automation-probe`; `web_automation_probe` is only registered after that command is run.
+
+## Current skills
+
+- `skills/web-search/` — automatic skill for using `web_research`.
+- `skills/web-automation-gw/` — manual-only skill (`disable-model-invocation: true`), invoked with `/skill:web-automation-gw`.
+- `skills/web-scraper-dev/` — manual-only skill (`disable-model-invocation: true`), invoked with `/skill:web-scraper-dev`.
 
 ## Web-use notes
 

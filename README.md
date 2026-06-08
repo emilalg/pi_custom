@@ -5,7 +5,7 @@ This repository is a pi package that can host multiple pi extensions.
 ## Extensions
 
 - `extensions/web-use/` — pipe-driven browser web research extension. Registers `web_research` and `/web-use-status`.
-- `extensions/placeholder/` — placeholder second extension with `/placeholder-extension`.
+- `extensions/web-automation/` — manual web automation probe loader. Registers `/enable-web-automation-probe`; the `web_automation_probe` tool is only added after that command is run.
 
 ## Use locally
 
@@ -26,10 +26,16 @@ Pi loads extensions from the `package.json` `pi.extensions` manifest:
 ```json
 {
   "pi": {
-    "extensions": ["./extensions/*/index.ts"]
+    "extensions": [
+      "./extensions/web-use/index.ts",
+      "./extensions/web-automation/index.ts"
+    ],
+    "skills": ["./skills/*"]
   }
 }
 ```
+
+Skills in `skills/` are discovered by pi. `web-search` is available for automatic model invocation; scraping/automation skills set `disable-model-invocation: true`, so they are available only through explicit `/skill:<name>` commands.
 
 ## Development
 

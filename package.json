@@ -10,7 +10,8 @@
   "type": "module",
   "pi": {
     "extensions": [
-      "./extensions/*/index.ts"
+      "./extensions/web-use/index.ts",
+      "./extensions/web-automation/index.ts"
     ],
     "skills": [
       "./skills/*"

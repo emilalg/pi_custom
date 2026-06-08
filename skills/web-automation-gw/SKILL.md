@@ -1,6 +1,7 @@
 ---
 name: web-automation-gw
 description: "Investigate a target website for a requested web automation directive and produce an implementation handoff: page/data structure, candidate endpoints, headers/cookies/auth signals, relevant HTML snippets, selectors, forms, pagination/sorting clues, and whether JS/headless browsing is likely required. Do not write automation code."
+disable-model-invocation: true
 ---
 
 # Web Automation Gateway

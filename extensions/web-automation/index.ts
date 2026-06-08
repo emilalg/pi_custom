@@ -157,41 +157,63 @@ function summarizeProbe(result: Awaited<ReturnType<typeof probeSite>>): string {
 }
 
 export default function webAutomationExtension(pi: ExtensionAPI) {
-	pi.registerTool({
-		name: "web_automation_probe",
-		label: "Web Automation Probe",
-		description: "Inspect a website through Chrome for automation handoff evidence: DOM structure, embedded data, forms/links, and network requests/headers.",
-		promptSnippet: "Probe a target website for web automation evidence including DOM, embedded JSON, forms, links, and network API calls.",
-		promptGuidelines: [
-			"Use web_automation_probe when designing or evaluating a browser automation, extraction, QA, monitoring, or scraping approach for a specific public website.",
-			"Use web_automation_probe to gather evidence only; do not use it to bypass authentication, CAPTCHA, paywalls, or bot protections.",
-		],
-		parameters: Type.Object({
-			task: Type.String({ description: "Scraping directive, ideally including a target URL." }),
-			url: Type.Optional(Type.String({ description: "Explicit target URL. If omitted, the first URL in task is used; as a last resort a search result may be used." })),
-			profile: Type.Optional(Type.String({ description: "Persistent browser profile key. Default web-automation or active skill if detectable." })),
-			rawOutput: Type.Optional(Type.Boolean({ description: "Include detailed DOM/network evidence in details. Default true for this probe." })),
-		}),
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			try {
-				const profile = inferProfile(params.profile, ctx);
-				const url = params.url || extractUrl(params.task) || (await searchFirstResult(params.task, signal));
-				if (!url) throw new Error("No target URL found. Provide a URL or a task specific enough to search.");
-				const result = await probeSite(params.task, url, profile, signal);
-				return {
-					content: text(summarizeProbe(result)),
-					details: {
-						profile,
-						requestedUrl: result.requestedUrl,
-						finalUrl: result.dom.finalUrl,
-						title: result.dom.title,
-						requests: result.requests,
-						dom: params.rawOutput === false ? undefined : result.dom,
-					},
-				};
-			} catch (error) {
-				return { content: text(error instanceof Error ? error.message : String(error)), details: undefined, isError: true };
+	let probeRegistered = false;
+
+	function registerProbeTool() {
+		if (probeRegistered) return false;
+		probeRegistered = true;
+
+		pi.registerTool({
+			name: "web_automation_probe",
+			label: "Web Automation Probe",
+			description: "Inspect a website through Chrome for automation handoff evidence: DOM structure, embedded data, forms/links, and network requests/headers.",
+			promptSnippet: "Probe a target website for automation evidence including DOM, embedded JSON, forms, links, and network API calls.",
+			promptGuidelines: [
+				"Use web_automation_probe only after the user manually enables web automation probing for a scraping, extraction, QA, monitoring, or browser-workflow task.",
+				"Use web_automation_probe to gather evidence only; do not use it to bypass authentication, CAPTCHA, paywalls, or bot protections.",
+			],
+			parameters: Type.Object({
+				task: Type.String({ description: "Scraping directive, ideally including a target URL." }),
+				url: Type.Optional(Type.String({ description: "Explicit target URL. If omitted, the first URL in task is used; as a last resort a search result may be used." })),
+				profile: Type.Optional(Type.String({ description: "Persistent browser profile key. Default web-automation or active skill if detectable." })),
+				rawOutput: Type.Optional(Type.Boolean({ description: "Include detailed DOM/network evidence in details. Default true for this probe." })),
+			}),
+			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+				try {
+					const profile = inferProfile(params.profile, ctx);
+					const url = params.url || extractUrl(params.task) || (await searchFirstResult(params.task, signal));
+					if (!url) throw new Error("No target URL found. Provide a URL or a task specific enough to search.");
+					const result = await probeSite(params.task, url, profile, signal);
+					return {
+						content: text(summarizeProbe(result)),
+						details: {
+							profile,
+							requestedUrl: result.requestedUrl,
+							finalUrl: result.dom.finalUrl,
+							title: result.dom.title,
+							requests: result.requests,
+							dom: params.rawOutput === false ? undefined : result.dom,
+						},
+					};
+				} catch (error) {
+					return { content: text(error instanceof Error ? error.message : String(error)), details: undefined, isError: true };
+				}
+			},
+		});
+		return true;
+	}
+
+	pi.registerCommand("enable-web-automation-probe", {
+		description: "Manually enable the scraping/web automation probe tool for this session",
+		handler: async (_args, ctx) => {
+			const registered = registerProbeTool();
+			if (registered && !pi.getActiveTools().includes("web_automation_probe")) {
+				pi.setActiveTools([...pi.getActiveTools(), "web_automation_probe"]);
 			}
+			ctx.ui.notify(
+				registered ? "web_automation_probe enabled for this session" : "web_automation_probe is already enabled",
+				"info",
+			);
 		},
 	});
 }

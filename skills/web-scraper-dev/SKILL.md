@@ -1,6 +1,7 @@
 ---
 name: web-scraper-dev
 description: Design and implement robust Python web scrapers. Use after a site has been investigated or when building a scraper from known endpoints/selectors. Prefers uv, curl_cffi for HTTP-only scraping, zendriver for browser automation, and includes retry/rate-limit/resume/failure handling.
+disable-model-invocation: true
 ---
 
 # Web Scraper Developer
